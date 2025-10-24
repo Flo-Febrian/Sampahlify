@@ -1,20 +1,24 @@
-
-import os, json
+# app.py — Sampahlify (Streamlit)
+import os
+import json
 import numpy as np
 from PIL import Image
-import gradio as gr
+import streamlit as st
 
 # ====== KONFIGURASI ======
 IMG_SIZE = (224, 224)
-MODEL_LOCAL_PATH = "model_klasifikasi_sampah.h5"   # letakkan file ini di root Space
-LABEL_MAP_LOCAL_PATH = "label_map.json"            # letakkan di root Space
-USE_HF_HUB = False                                 # set True jika mau download dari repo model terpisah
-HF_REPO_ID = "username/repo-model-anda"            # ganti jika USE_HF_HUB=True
+MODEL_LOCAL_PATH = "model_klasifikasi_sampah.h5"   # taruh di root repo/app
+LABEL_MAP_LOCAL_PATH = "label_map.json"            # taruh di root repo/app
+
+# Jika ingin ambil aset dari Hugging Face Hub, set True dan isi repo_id
+USE_HF_HUB = False
+HF_REPO_ID = "username/repo-model-anda"            # ex: "luciphella/sampahlify-model"
 HF_MODEL_FILENAME = "model_klasifikasi_sampah.h5"
 HF_LABELMAP_FILENAME = "label_map.json"
 
-# ====== LOAD MODEL & LABEL MAP ======
-def ensure_assets():
+# ====== UTIL ======
+def ensure_assets() -> tuple[str, str]:
+    """Pastikan file model & label_map tersedia, opsional unduh dari Hub."""
     model_path = MODEL_LOCAL_PATH
     labelmap_path = LABEL_MAP_LOCAL_PATH
 
@@ -33,30 +37,31 @@ def ensure_assets():
 
     return model_path, labelmap_path
 
-model_path, labelmap_path = ensure_assets()
+# ====== LOAD ASET (cache agar cepat) ======
+@st.cache_resource(show_spinner=False)
+def load_assets():
+    model_path, labelmap_path = ensure_assets()
 
-# Import TensorFlow setelah aset siap (mempercepat start-up jika gagal)
-import tensorflow as tf
-from tensorflow.keras.models import load_model
+    # Import TF di dalam cache agar tidak reload berulang
+    import tensorflow as tf
+    from tensorflow.keras.models import load_model
 
-model = load_model(model_path)
+    model = load_model(model_path)
+    with open(labelmap_path, "r") as f:
+        label_map = json.load(f)   # contoh: {"anorganik": 0, "organik": 1}
+    inv_label_map = {v: k for k, v in label_map.items()}
+    pretty = {"anorganik": "Anorganik", "organik": "Organik"}
+    return model, label_map, inv_label_map, pretty
 
-with open(labelmap_path, "r") as f:
-    label_map = json.load(f)  # contoh: {"anorganik": 0, "organik": 1}
-inv_label_map = {v: k for k, v in label_map.items()}
-pretty = {"anorganik": "Anorganik", "organik": "Organik"}
-
-def preprocess(pil_img: Image.Image):
+def preprocess(pil_img: Image.Image) -> np.ndarray:
     img = pil_img.convert("RGB").resize(IMG_SIZE)
-    arr = np.array(img).astype("float32") / 255.0
-    arr = np.expand_dims(arr, axis=0)
+    arr = np.asarray(img).astype("float32") / 255.0
+    arr = np.expand_dims(arr, axis=0)  # (1, 224, 224, 3)
     return arr
 
-def predict(pil_img: Image.Image):
-    if pil_img is None:
-        return "Unggah gambar dulu.", {}
+def predict_image(model, label_map, inv_label_map, pretty, pil_img: Image.Image):
     x = preprocess(pil_img)
-    # Output sigmoid 1 neuron => probabilitas kelas indeks 1
+    # Output sigmoid 1 neuron → probabilitas kelas indeks 1
     prob_class1 = float(model.predict(x, verbose=0)[0][0])
 
     idx_organik = label_map.get("organik", 1)
@@ -68,26 +73,59 @@ def predict(pil_img: Image.Image):
         p_org = 1.0 - prob_class1
 
     if p_org >= p_anon:
-        label = pretty["organik"]; conf = p_org
+        label_idx = 1
+        conf = p_org
     else:
-        label = pretty["anorganik"]; conf = p_anon
+        label_idx = 0
+        conf = p_anon
 
+    label_raw = inv_label_map.get(label_idx, "organik" if label_idx == 1 else "anorganik")
+    label_pretty = pretty.get(label_raw, label_raw.capitalize())
     probs = {"Anorganik": round(p_anon, 4), "Organik": round(p_org, 4)}
-    return f"{label} — {conf*100:.2f}%", probs
+    return label_pretty, conf, probs
 
-with gr.Blocks(title="Klasifikasi Sampah (MobileNetV2)") as demo:
-    gr.Markdown(
-        '''
-        # Klasifikasi Sampah (MobileNetV2)
-        Unggah foto sampah. Model memprediksi **Organik** atau **Anorganik**.
-        '''
+# ====== UI ======
+st.set_page_config(page_title="Sampahlify", page_icon="♻️", layout="centered")
+
+st.title("♻️ Sampahlify")
+st.caption("Klasifikasi sampah **Organik** vs **Anorganik** (MobileNetV2, Transfer Learning)")
+
+with st.expander("Cara pakai", expanded=False):
+    st.markdown(
+        "- Unggah gambar .jpg/.png\n"
+        "- Aplikasi akan menampilkan label prediksi dan confidence\n"
+        "- Model & mapping kelas dibaca dari file di root repo"
     )
-    inp = gr.Image(type="pil", label="Unggah Gambar", sources=["upload", "clipboard"])
-    out_text = gr.Textbox(label="Prediksi", interactive=False)
-    out_probs = gr.Label(label="Probabilitas")
-    btn = gr.Button("Prediksi")
 
-    btn.click(fn=predict, inputs=inp, outputs=[out_text, out_probs])
-    inp.change(fn=predict, inputs=inp, outputs=[out_text, out_probs])
+# Sidebar
+st.sidebar.header("Pengaturan")
+st.sidebar.write(f"Ukuran input model: **{IMG_SIZE[0]}×{IMG_SIZE[1]}**")
+st.sidebar.write("Mode aset:", "**Hugging Face Hub**" if USE_HF_HUB else "**Local files**")
 
-demo.launch()
+# Load model & label map
+with st.status("Memuat model…", expanded=False):
+    model, label_map, inv_label_map, pretty = load_assets()
+st.success("Model siap dipakai.")
+
+# Upload
+uploaded = st.file_uploader("Unggah gambar", type=["jpg", "jpeg", "png"])
+if uploaded:
+    pil = Image.open(uploaded).convert("RGB")
+    st.image(pil, caption="Gambar diunggah", use_container_width=True)
+
+    with st.spinner("Memproses…"):
+        label, conf, probs = predict_image(model, label_map, inv_label_map, pretty, pil)
+
+    st.subheader(f"Hasil: **{label}** — {conf*100:.2f}%")
+    st.progress(conf)
+
+    # Tampilkan probabilitas
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Organik", f"{probs['Organik']*100:.2f}%")
+    with c2:
+        st.metric("Anorganik", f"{probs['Anorganik']*100:.2f}%")
+
+    st.caption("Tip: gunakan foto jelas dengan objek dominan untuk hasil terbaik.")
+else:
+    st.info("Unggah gambar untuk mulai prediksi.")
